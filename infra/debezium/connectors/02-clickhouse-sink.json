@@ -1,0 +1,47 @@
+{
+  "name": "clickhouse-orders-sink",
+  "config": {
+    "connector.class": "com.clickhouse.kafka.connect.ClickHouseSinkConnector",
+
+    
+    
+    "topics": "outbox.event.orders",
+
+    
+    
+    "hostname": "clickhouse",
+    "port": "8123",
+    "ssl": "false",
+    "username": "chuser",
+    "password": "chpass",
+    "database": "analytics",
+
+    
+    
+    "topics.tables.map": "outbox.event.orders:orders_cdc",
+
+    
+    
+    "insert.distribution.policy": "roundrobin",
+
+    
+    "consumer.override.max.poll.records": "500",
+    "consumer.override.fetch.min.bytes": "1048576",
+    "consumer.override.fetch.max.wait.ms": "1000",
+
+    
+    
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+
+    
+    
+    "errors.tolerance": "all",
+    "errors.deadletterqueue.topic.name": "clickhouse.dlq",
+    "errors.deadletterqueue.context.headers.enable": "true",
+    "errors.retry.timeout": "60000",
+    "errors.retry.delay.max.ms": "10000"
+  }
+}

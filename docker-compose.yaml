@@ -1,0 +1,331 @@
+version: "3.9"
+
+# =============================================================================
+# Outbox Pattern + CDC Stack
+#
+# Data flow:
+#   FastAPI ──write──► postgres (orders + outbox_events) [one transaction]
+#                           │
+#                    WAL logical replication
+#                           │
+#                      Debezium (kafka-connect)
+#                      reads outbox_events via pgoutput plugin
+#                      applies Outbox Event Router SMT
+#                           │
+#                        Kafka
+#                      topic: outbox.event.orders
+#                           │
+#              ┌────────────┴──────────────┐
+#              │                           │
+#        JDBC Sink                   consumer (Python)
+#        connector                   explicit Kafka consumer
+#              │                           │
+#       postgres-analytics          (same postgres-analytics)
+#       orders_cdc table            you can point it anywhere
+#
+# Ports exposed on host:
+#   5432  — source postgres
+#   5433  — analytics postgres
+#   9092  — kafka (external)
+#   8080  — kafka-ui (browser)
+#   8083  — kafka-connect REST API
+#   8000  — FastAPI
+# =============================================================================
+
+networks:
+  cdc-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  postgres_analytics_data:
+  kafka_data:
+  zookeeper_data:
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # SOURCE POSTGRES
+  #
+  # WHY wal_level=logical:
+  #   Default wal_level is "replica" — enough for standby replication but
+  #   it only records enough to reconstruct pages, not decode row changes.
+  #   "logical" adds full before/after column values to WAL records so that
+  #   the pgoutput plugin (and therefore Debezium) can decode INSERT/UPDATE/DELETE
+  #   into structured JSON. Without this Debezium cannot start.
+  #
+  # WHY max_replication_slots=4:
+  #   Each Debezium connector instance holds one replication slot open.
+  #   The slot is how Postgres tracks "this consumer has read up to LSN X"
+  #   and guarantees it won't delete WAL segments before that point.
+  #   We set 4 so you have headroom for multiple connectors or restarts.
+  #
+  # NOTE: No postgresql.conf volume mount here — we pass all config via
+  #   command-line flags so the container stays self-contained.
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: outbox_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-orderuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-orderpass}
+      POSTGRES_DB: ${POSTGRES_DB:-ordersdb}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    command: >
+      postgres
+        -c wal_level=logical
+        -c max_wal_senders=4
+        -c max_replication_slots=4
+        -c wal_keep_size=256
+        -c log_replication_commands=on
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-orderuser} -d ${POSTGRES_DB:-ordersdb}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - cdc-net
+
+  # ---------------------------------------------------------------------------
+  # ZOOKEEPER
+  #
+  # WHY it exists:
+  #   Kafka brokers use Zookeeper for leader election, cluster membership,
+  #   and storing topic/partition metadata. In Kafka 3.x+ you can use KRaft
+  #   (Kafka's own Raft implementation) to eliminate Zookeeper, but the
+  #   Confluent Kafka Connect image we use still defaults to ZK mode.
+  #   For POC purposes ZK is fine — just don't expose port 2181 externally.
+  # ---------------------------------------------------------------------------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: outbox_zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+    networks:
+      - cdc-net
+
+  # ---------------------------------------------------------------------------
+  # KAFKA
+  #
+  # WHY two listeners (PLAINTEXT vs PLAINTEXT_HOST):
+  #   Inside Docker network: other containers reach Kafka at kafka:29092
+  #   Outside Docker (your host terminal, Python scripts): reach at localhost:9092
+  #   Kafka advertises different addresses depending on which listener a client
+  #   connects through. Without this split, cross-container comms work but
+  #   your host-side kafka-console-consumer would fail.
+  #
+  # WHY KAFKA_AUTO_CREATE_TOPICS_ENABLE=true:
+  #   Debezium's Outbox Event Router creates topics like outbox.event.orders
+  #   automatically when it first routes a message there. Saves manual setup.
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: outbox_kafka
+    restart: unless-stopped
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    networks:
+      - cdc-net
+
+  # ---------------------------------------------------------------------------
+  # KAFKA UI
+  #
+  # WHY it's here:
+  #   This is your primary debugging tool. You can:
+  #     - See topics created by Debezium in real time
+  #     - Inspect every message payload on outbox.event.orders
+  #     - Monitor consumer group offsets (is your consumer keeping up?)
+  #     - Check kafka-connect connector status without curl
+  #   Visit: http://localhost:8080
+  # ---------------------------------------------------------------------------
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: outbox_kafka_ui
+    restart: unless-stopped
+    depends_on:
+      - kafka
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: debezium
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://kafka-connect:8083
+    networks:
+      - cdc-net
+
+  # ---------------------------------------------------------------------------
+  # KAFKA CONNECT (Debezium)
+  #
+  # WHY build instead of using a pre-built image:
+  #   The base cp-kafka-connect image has no connectors installed.
+  #   Our Dockerfile runs `confluent-hub install` to add:
+  #     1. debezium-connector-postgresql — reads WAL (source)
+  #     2. kafka-connect-jdbc           — writes to postgres-analytics (sink)
+  #
+  # WHY depends_on with condition: service_healthy:
+  #   Debezium tries to connect to Postgres immediately on startup to create
+  #   the replication slot. If Postgres isn't fully ready yet, Debezium
+  #   crashes and restarts. The healthcheck on postgres prevents this race.
+  #
+  # HOW connectors are registered:
+  #   The container exposes a REST API on port 8083. After startup you POST
+  #   the connector config JSON to /connectors. The register_connectors.sh
+  #   script does this. The ./infra/debezium/connectors/ volume mount is
+  #   only used by that script — Kafka Connect itself reads config from Kafka
+  #   internal topics (_connect-configs), not from files.
+  # ---------------------------------------------------------------------------
+  kafka-connect:
+    build:
+      context: ./infra/debezium
+      dockerfile: Dockerfile
+    container_name: outbox_kafka_connect
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8083:8083"
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: kafka:29092
+      CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
+      CONNECT_REST_PORT: 8083
+      CONNECT_GROUP_ID: outbox-cdc-connect-group
+      # These three topics are how Kafka Connect stores its own state in Kafka
+      # (connector configs, WAL offsets, connector running/paused/failed status)
+      CONNECT_CONFIG_STORAGE_TOPIC: _connect-configs
+      CONNECT_OFFSET_STORAGE_TOPIC: _connect-offsets
+      CONNECT_STATUS_STORAGE_TOPIC: _connect-status
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
+      # JSON converter — no schema registry needed for POC.
+      # Messages land in Kafka as plain JSON objects.
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_PLUGIN_PATH: /usr/share/java,/usr/share/confluent-hub-components
+    networks:
+      - cdc-net
+
+  # ---------------------------------------------------------------------------
+  # ANALYTICS POSTGRES
+  #
+  # WHY a second Postgres instead of ClickHouse:
+  #   Same tool you already know. JDBC sink connector has native PG support.
+  #   Swap to ClickHouse later by changing only the sink connector config.
+  #
+  # Port 5433 on host to avoid clash with source postgres on 5432.
+  # Inside Docker network both are reachable by container name on port 5432.
+  # ---------------------------------------------------------------------------
+  postgres-analytics:
+    image: postgres:16-alpine
+    container_name: outbox_postgres_analytics
+    restart: unless-stopped
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: ${ANALYTICS_POSTGRES_USER:-analyticsuser}
+      POSTGRES_PASSWORD: ${ANALYTICS_POSTGRES_PASSWORD:-analyticspass}
+      POSTGRES_DB: ${ANALYTICS_POSTGRES_DB:-analyticsdb}
+    volumes:
+      - postgres_analytics_data:/var/lib/postgresql/data
+      - ./infra/postgres-analytics/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ANALYTICS_POSTGRES_USER:-analyticsuser} -d ${ANALYTICS_POSTGRES_DB:-analyticsdb}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - cdc-net
+
+  # ---------------------------------------------------------------------------
+  # FASTAPI
+  #
+  # Depends only on source postgres. It has no knowledge of Kafka or Debezium —
+  # it just writes to two tables in one transaction and returns.
+  # The CDC pipeline is completely invisible to the API layer.
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: outbox_api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-orderuser}:${POSTGRES_PASSWORD:-orderpass}@postgres:5432/${POSTGRES_DB:-ordersdb}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    networks:
+      - cdc-net
+
+  # ---------------------------------------------------------------------------
+  # KAFKA CONSUMER (Python)
+  #
+  # WHY this exists alongside the JDBC sink:
+  #   The JDBC sink is a black-box connector — you configure it and it works,
+  #   but you can't see what it's doing internally. This explicit Python consumer
+  #   is your learning tool: it shows exactly what a Kafka message looks like,
+  #   how consumer group offsets work, and how you'd write your own downstream
+  #   service. In production you'd likely use one or the other, not both.
+  #
+  # It reads from the same topic (outbox.event.orders) as the JDBC sink but
+  # uses a different consumer group ID so both get all messages independently.
+  # ---------------------------------------------------------------------------
+  consumer:
+    build:
+      context: ./consumer
+      dockerfile: Dockerfile
+    container_name: outbox_consumer
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres-analytics:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: outbox.event.orders
+      KAFKA_GROUP_ID: python-consumer-group
+      ANALYTICS_DB_URL: postgresql://analyticsuser:analyticspass@postgres-analytics:5432/analyticsdb
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    networks:
+      - cdc-net
