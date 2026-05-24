@@ -3,7 +3,7 @@
 ## Architecture
 
 ```
-FastAPI → PostgreSQL (WAL logical) → Debezium → Kafka → ClickHouse
+FastAPI → PostgreSQL (WAL logical) → Debezium → Kafka → PostgreSQL Analytics (JDBC Sink)
                                               ↘ Downstream Services
 ```
 
@@ -25,13 +25,13 @@ docker compose up -d
 # 3. Wait for all services to be healthy
 docker compose ps
 
-# 4. Register Debezium + ClickHouse connectors
-chmod +x scripts/register_connectors.sh
-./scripts/register_connectors.sh
+# 4. Register Debezium + JDBC Sink connectors
+chmod +x scripts/register-connectors.sh
+./scripts/register-connectors.sh
 
 # 5. Run the smoke test
-chmod +x scripts/smoke_test.sh
-./scripts/smoke_test.sh
+chmod +x scripts/smoke-test.sh
+./scripts/smoke-test.sh
 ```
 
 ## Service URLs
@@ -42,7 +42,7 @@ chmod +x scripts/smoke_test.sh
 | Kafka UI | http://localhost:8080 | Topic/consumer management |
 | Kafka Connect | http://localhost:8083 | Connector REST API |
 | Schema Registry | http://localhost:8081 | Schema management |
-| ClickHouse HTTP | http://localhost:8123 | Query interface |
+| PostgreSQL Analytics | localhost:5433 | CDC Sink |
 
 ## API Endpoints
 
@@ -89,7 +89,7 @@ doesn't care about those updates. This keeps WAL volume minimal.
 ### Why we don't hard-delete orders
 Orders are soft-deleted (deleted_at + status=CANCELLED) for:
 - Audit compliance (GDPR Article 17 requires tracking deletion requests)
-- ClickHouse CDC integrity (hard deletes create tombstones that need special handling)
+- Analytics database CDC integrity (hard deletes create tombstones that need special handling)
 - Debugging (you can always see what existed)
 
 ### Optimistic locking
@@ -107,22 +107,20 @@ With SMT, it:
 
 Result: consumers receive clean domain events on per-entity topics.
 
-### ClickHouse ReplacingMergeTree
-ClickHouse is append-only by design. `ReplacingMergeTree(version)` handles
-CDC upserts by:
-1. Accepting all INSERTs (every CDC event = one row)
-2. During background merges, deduplicating by ORDER BY key, keeping highest `version`
-3. For queries needing current state: use `FINAL` keyword or `argMax()` aggregate
+### PostgreSQL Analytics JDBC Sink
+We use a PostgreSQL replica for analytics. The JDBC Sink connector handles CDC upserts by:
+1. Using `insert.mode = upsert`
+2. Setting `pk.mode = record_value` and `pk.fields = order_id`
+3. Applying updates to the target table (`orders_cdc`) based on the primary key
 
 ```sql
 -- Current state query (consistent)
-SELECT order_id, argMax(status, version) AS status
-FROM analytics.orders_cdc
-GROUP BY order_id
+SELECT order_id, status, version, last_event_type 
+FROM orders_cdc 
+WHERE order_id = '...';
 
--- Or use the pre-built materialized view:
-SELECT * FROM analytics.orders_current_state FINAL
-WHERE order_id = '...'
+-- Check average CDC lag via the view:
+SELECT * FROM cdc_lag_monitor;
 ```
 
 ## Monitoring
@@ -149,11 +147,11 @@ docker exec outbox_kafka kafka-console-consumer \
   --max-messages 5
 ```
 
-### Query ClickHouse
+### Query PostgreSQL Analytics
 ```bash
-docker exec outbox_clickhouse clickhouse-client \
-  --user chuser --password chpass \
-  --query "SELECT event_type, count() FROM analytics.orders_cdc GROUP BY event_type"
+docker exec outbox_postgres_analytics psql \
+  -U analyticsuser -d analyticsdb -c \
+  "SELECT last_event_type, COUNT(*) FROM orders_cdc GROUP BY last_event_type;"
 ```
 
 ## Running Tests
@@ -168,7 +166,7 @@ pytest tests/ -v --cov=app --cov-report=term-missing
 
 ```
 outbox-cdc-project/
-├── docker-compose.yml              # Full stack: PG, Kafka, Debezium, ClickHouse, API
+├── docker-compose.yaml             # Full stack: PG, Kafka, Debezium, PG Analytics, API
 ├── .env.example                    # Environment variables template
 │
 ├── api/                            # FastAPI application
@@ -197,15 +195,16 @@ outbox-cdc-project/
 │   │       ├── 001_init_schema.sql     # Tables, enums, indexes, publication
 │   │       └── 002_replication_setup.sql # Replication role, monitoring views
 │   ├── debezium/
-│   │   ├── Dockerfile                  # Debezium + ClickHouse connector install
+│   │   ├── Dockerfile                  # Debezium + JDBC connector install
 │   │   └── connectors/
 │   │       ├── 01-postgres-source.json # WAL reader + Outbox Event Router SMT
-│   │       └── 02-clickhouse-sink.json # Kafka → ClickHouse sync
-│   └── clickhouse/
-│       └── init/
-│           └── 001_orders_cdc.sql      # ReplacingMergeTree + materialized views
+│   │       ├── 02-clickhouse-sink.json # Kafka → ClickHouse sync (deprecated)
+│   │       └── 03-jdbc-sink.json       # Kafka → Postgres Analytics sync
+│   └── postgres-analytics/
+│       └── 001-orders-cdc.sql          # Upsert table + lag monitor views
 │
 └── scripts/
-    ├── register_connectors.sh      # Register connectors via Connect REST API
-    └── smoke_test.sh               # End-to-end pipeline validation
+    ├── project-setup.sh            # Project initial setup script
+    ├── register-connectors.sh      # Register connectors via Connect REST API
+    └── smoke-test.sh               # End-to-end pipeline validation
 ```

@@ -15,6 +15,7 @@ that makes the outbox pattern work: there is never a state where the business
 entity is written but the event is not (or vice versa).
 """
 
+import json
 import uuid
 from typing import Any
 
@@ -65,7 +66,7 @@ class OutboxService:
     ) -> OutboxEvent:
         payload = self._build_order_payload(order, deleted=False)
         # Include which fields changed so consumers can filter irrelevant updates
-        payload["changed_fields"] = changed_fields
+        payload["changed_fields"] = json.dumps(changed_fields) if changed_fields is not None else None
         return await self._insert_event(
             aggregate_id=order.id,
             event_type=OutboxEventType.ORDER_UPDATED,
@@ -115,11 +116,12 @@ class OutboxService:
 
             # Current state
             "status": order.status.value if hasattr(order.status, "value") else order.status,
-            "line_items": order.line_items,
+            "line_items": json.dumps(order.line_items) if order.line_items is not None else "[]",
             "total_amount_cents": order.total_amount_cents,
             "currency": order.currency,
-            "shipping_address": order.shipping_address,
-            "metadata": order.metadata_,
+            "shipping_address": json.dumps(order.shipping_address) if order.shipping_address is not None else None,
+            "metadata": json.dumps(order.metadata_) if order.metadata_ is not None else "{}",
+            "changed_fields": None,
 
             # Versioning
             "version": order.version,

@@ -2,30 +2,25 @@
   "name": "postgres-analytics-sink",
   "config": {
     "connector.class": "io.confluent.connect.jdbc.JdbcSinkConnector",
-
     "topics": "outbox.event.orders",
-
     "connection.url": "jdbc:postgresql://postgres-analytics:5432/analyticsdb",
     "connection.user": "analyticsuser",
     "connection.password": "analyticspass",
-
     "insert.mode": "upsert",
     "pk.mode": "record_value",
     "pk.fields": "order_id",
-
     "table.name.format": "orders_cdc",
     "auto.create": "false",
     "auto.evolve": "false",
-
     "value.converter": "org.apache.kafka.connect.json.JsonConverter",
-    "value.converter.schemas.enable": "false",
+    "value.converter.schemas.enable": "true",
     "key.converter": "org.apache.kafka.connect.json.JsonConverter",
-    "key.converter.schemas.enable": "false",
-
+    "key.converter.schemas.enable": "true",
     "batch.size": "200",
-
+    "consumer.override.max.poll.records": "500",
     "errors.tolerance": "all",
     "errors.deadletterqueue.topic.name": "analytics.dlq",
+    "errors.deadletterqueue.topic.replication.factor": 1,
     "errors.deadletterqueue.context.headers.enable": "true",
     "errors.log.enable": "true",
     "errors.log.include.messages": "true"

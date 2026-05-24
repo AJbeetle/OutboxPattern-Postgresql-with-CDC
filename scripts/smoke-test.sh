@@ -3,18 +3,18 @@
 # smoke_test.sh — End-to-end test of the full CDC pipeline
 #
 # Tests:
-#   1. Create order via API → verify in Postgres
+#   1. Create order via API → verify in Postgres (source)
 #   2. Verify outbox_event was written atomically
 #   3. Verify Kafka topic received the event
-#   4. Verify ClickHouse received the analytics row
+#   4. Verify postgres-analytics received the CDC upsert
 # =============================================================================
 
 set -euo pipefail
 
-API_URL="${API_URL:-http://localhost:8000}"
+API_URL="${API_URL:-http://localhost:8001}"
 KAFKA_CONTAINER="${KAFKA_CONTAINER:-outbox_kafka}"
 PG_CONTAINER="${PG_CONTAINER:-outbox_postgres}"
-CH_CONTAINER="${CH_CONTAINER:-outbox_clickhouse}"
+ANALYTICS_CONTAINER="${ANALYTICS_CONTAINER:-outbox_postgres_analytics}"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 
@@ -152,18 +152,26 @@ TOTAL_OUTBOX=$(docker exec "$PG_CONTAINER" psql -U orderuser -d ordersdb -t -c \
     || echo -e "${YELLOW}⚠ WARN${NC}  Expected 3 events, found $TOTAL_OUTBOX"
 
 # ---------------------------------------------------------------------------
-# Step 8: ClickHouse check (if available)
+# Step 8: postgres-analytics check — verify CDC upsert landed
 # ---------------------------------------------------------------------------
-step "Step 8: Check ClickHouse analytics table"
-sleep 10  # give sink connector time to batch and write
+step "Step 8: Check postgres-analytics CDC table"
+sleep 10  # give JDBC sink connector time to batch and write
 
-CH_COUNT=$(docker exec "$CH_CONTAINER" clickhouse-client \
-    --user chuser --password chpass \
-    --query "SELECT count() FROM analytics.orders_cdc WHERE order_id = '$ORDER_ID'" 2>/dev/null || echo "0")
+ANALYTICS_ROW=$(docker exec "$ANALYTICS_CONTAINER" psql -U analyticsuser -d analyticsdb -t -c \
+    "SELECT order_id, status, version, last_event_type FROM orders_cdc WHERE order_id = '$ORDER_ID';" \
+    2>/dev/null || echo "")
 
-CH_COUNT=$(echo "$CH_COUNT" | tr -d ' \n')
-[[ "$CH_COUNT" -ge "1" ]] && pass "ClickHouse has $CH_COUNT CDC rows for order $ORDER_ID" \
-    || echo -e "${YELLOW}⚠ WARN${NC}  ClickHouse not yet synced (connector may still be starting)"
+if [[ -n "$ANALYTICS_ROW" ]]; then
+    pass "postgres-analytics has CDC row for order $ORDER_ID"
+    echo "  Row: $ANALYTICS_ROW"
+else
+    echo -e "${YELLOW}⚠ WARN${NC}  postgres-analytics not yet synced (JDBC connector may still be starting)"
+fi
+
+# Also verify the cdc_lag_monitor view
+LAG=$(docker exec "$ANALYTICS_CONTAINER" psql -U analyticsuser -d analyticsdb -t -c \
+    "SELECT ROUND(avg_cdc_lag_seconds::numeric, 2) FROM cdc_lag_monitor;" 2>/dev/null | tr -d ' \n' || echo "N/A")
+echo "  Average CDC lag: ${LAG}s"
 
 echo -e "\n${GREEN}══ Smoke test complete ══${NC}"
 echo "Order ID: $ORDER_ID"

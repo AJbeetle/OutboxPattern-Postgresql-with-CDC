@@ -1,1 +1,0 @@
-mkdir -p outbox-cdc-project/{api/{app/{routers,models,db,services,core},tests},infra/{postgres,debezium,clickhouse,kafka},scripts,docs}

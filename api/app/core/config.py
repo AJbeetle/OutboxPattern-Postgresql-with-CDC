@@ -6,7 +6,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     # Database
-    database_url: str = "postgresql+asyncpg://orderuser:orderpass@localhost:5432/ordersdb"
+    database_url: str = "postgresql+asyncpg://orderuser:orderpass@localhost:5433/ordersdb"
 
     # App
     environment: str = "development"

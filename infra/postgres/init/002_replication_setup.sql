@@ -29,8 +29,8 @@ GRANT SELECT ON TABLE orders TO debezium_user;
 GRANT USAGE ON SCHEMA public TO debezium_user;
 
 -- Grant permission to create replication slots
--- (In PG14+ this requires pg_create_logical_replication_slot privilege)
-GRANT pg_replication_origin_write TO debezium_user;
+-- (Note: In standard PostgreSQL, the REPLICATION privilege granted during role
+-- creation is sufficient to manage replication slots, so no extra grant is needed here).
 
 -- ---------------------------------------------------------------------------
 -- Logical replication slot — named cursor in WAL.

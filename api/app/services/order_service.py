@@ -147,6 +147,7 @@ class OrderService:
 
         # ── ATOMIC WRITE ──────────────────────────────────────────────────────
         await self._session.flush()
+        await self._session.refresh(order)
 
         await self._outbox.record_order_updated(
             order=order,
@@ -189,6 +190,7 @@ class OrderService:
 
         # ── ATOMIC WRITE ──────────────────────────────────────────────────────
         await self._session.flush()
+        await self._session.refresh(order)
 
         await self._outbox.record_order_deleted(
             order=order,
