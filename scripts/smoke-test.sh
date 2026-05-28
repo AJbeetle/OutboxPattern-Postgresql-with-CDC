@@ -169,9 +169,9 @@ else
 fi
 
 # Also verify the cdc_lag_monitor view
-LAG=$(docker exec "$ANALYTICS_CONTAINER" psql -U analyticsuser -d analyticsdb -t -c \
-    "SELECT ROUND(avg_cdc_lag_seconds::numeric, 2) FROM cdc_lag_monitor;" 2>/dev/null | tr -d ' \n' || echo "N/A")
-echo "  Average CDC lag: ${LAG}s"
+# LAG=$(docker exec "$ANALYTICS_CONTAINER" psql -U analyticsuser -d analyticsdb -t -c \
+#     "SELECT ROUND(avg_cdc_lag_seconds::numeric, 2) FROM cdc_lag_monitor;" 2>/dev/null | tr -d ' \n' || echo "N/A")
+# echo "  Average CDC lag: ${LAG}s"
 
 echo -e "\n${GREEN}══ Smoke test complete ══${NC}"
 echo "Order ID: $ORDER_ID"

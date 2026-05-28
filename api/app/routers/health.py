@@ -18,6 +18,8 @@ async def health_db(db: AsyncSession = Depends(get_db)):
     return {"status": "ok", "database": "connected"}
 
 
+# JUST INFORMATIONAL ENDPOINTS -> after debezium implementation these are not the right way to check lag between database and debezium
+
 @router.get("/health/outbox", summary="Outbox backlog monitor")
 async def health_outbox(db: AsyncSession = Depends(get_db)):
     """
