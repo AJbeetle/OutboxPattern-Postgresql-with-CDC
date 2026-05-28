@@ -1,5 +1,9 @@
 # Production-Grade Outbox Pattern + CDC with PostgreSQL WAL
 
+The primary objective of this Proof of Concept (POC) is to design and implement a reliable, fault-tolerant, end-to-end data replication pipeline [or to send an event to downstream services as kafka can have multiple consumers for an event]. 
+
+Aim to prove that business state changes (like creating, updating, or soft-deleting an order) can be atomically recorded and eventually propagated to an isolated analytical read-replica via Kafka. This ensures strict data consistency across systems, even under high concurrency, schema complexity, or network failures.
+
 ## Architecture
 
 ```
